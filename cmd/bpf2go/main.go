@@ -185,7 +185,7 @@ func run(stdout io.Writer, pkg, outputDir string, args []string) (err error) {
 		}
 		defer obj.Close()
 
-		err = writeCommon(writeArgs{
+		err = output(outputArgs{
 			pkg:   pkg,
 			ident: ident,
 			tags:  tags,

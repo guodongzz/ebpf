@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/internal/btf"
 )
 
 const ebpfModule = "github.com/cilium/ebpf"
@@ -27,11 +28,28 @@ package {{ .Package }}
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 
 	"{{ .Module }}"
 )
+
+{{- if .Types }}
+{{- range $type := .Types }}
+{{ $.TypeDeclaration (index $.TypeNames $type) $type }}
+
+{{ end }}
+{{- end }}
+
+// {{ .Name.Constants }} contains all constants used by {{ .Name }}.
+//
+// It only contains global, non-static constants and may be empty.
+{{- if .Constants }}
+{{ $.TypeDeclaration .Name.Constants .Constants }}
+{{- else }}
+type {{ .Name.Constants }} struct {}
+{{- end }}
 
 // {{ .Name.Load }} returns the embedded CollectionSpec for {{ .Name }}.
 func {{ .Name.Load }}() (*ebpf.CollectionSpec, error) {
@@ -52,11 +70,22 @@ func {{ .Name.Load }}() (*ebpf.CollectionSpec, error) {
 //     *{{ .Name.Programs }}
 //     *{{ .Name.Maps }}
 //
+// You can rewrite constants by supplying a non-nil consts argument.
+//
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func {{ .Name.LoadObjects }}(obj interface{}, opts *ebpf.CollectionOptions) (error) {
+func {{ .Name.LoadObjects }}(obj interface{}, consts *{{ .Name.Constants }}, opts *ebpf.CollectionOptions) error {
 	spec, err := {{ .Name.Load }}()
 	if err != nil {
 		return err
+	}
+
+	if consts != nil {
+		if spec.Maps[".rodata"] == nil {
+			return errors.New("can't replace constants: missing .rodata section")
+		}
+		spec.Maps[".rodata"].Contents = []ebpf.MapKV{
+			{Key: uint32(0), Value: consts},
+		}
 	}
 
 	return spec.LoadAndAssign(obj, opts)
@@ -173,15 +202,15 @@ func (n templateName) Bytes() string {
 }
 
 func (n templateName) Specs() string {
-	return n.maybeExport(string(n) + "Specs")
+	return string(n) + "Specs"
 }
 
 func (n templateName) ProgramSpecs() string {
-	return n.maybeExport(string(n) + "ProgramSpecs")
+	return string(n) + "ProgramSpecs"
 }
 
 func (n templateName) MapSpecs() string {
-	return n.maybeExport(string(n) + "MapSpecs")
+	return string(n) + "MapSpecs"
 }
 
 func (n templateName) Load() string {
@@ -193,22 +222,26 @@ func (n templateName) LoadObjects() string {
 }
 
 func (n templateName) Objects() string {
-	return n.maybeExport(string(n) + "Objects")
+	return string(n) + "Objects"
 }
 
 func (n templateName) Maps() string {
-	return n.maybeExport(string(n) + "Maps")
+	return string(n) + "Maps"
 }
 
 func (n templateName) Programs() string {
-	return n.maybeExport(string(n) + "Programs")
+	return string(n) + "Programs"
+}
+
+func (n templateName) Constants() string {
+	return string(n) + "Constants"
 }
 
 func (n templateName) CloseHelper() string {
 	return "_" + toUpperFirst(string(n)) + "Close"
 }
 
-type writeArgs struct {
+type outputArgs struct {
 	pkg   string
 	ident string
 	tags  []string
@@ -216,7 +249,7 @@ type writeArgs struct {
 	out   io.Writer
 }
 
-func writeCommon(args writeArgs) error {
+func output(args outputArgs) error {
 	obj, err := ioutil.ReadAll(args.obj)
 	if err != nil {
 		return fmt.Errorf("read object file contents: %s", err)
@@ -242,21 +275,48 @@ func writeCommon(args writeArgs) error {
 		programs[name] = identifier(name)
 	}
 
+	var constants *btf.Datasec
+	if rodata := spec.Maps[".rodata"]; rodata != nil {
+		constants, _ = btf.MapValue(rodata.BTF).(*btf.Datasec)
+	}
+
+	var (
+		namedTypes []btf.NamedType
+		names      map[btf.Type]string
+	)
+	if constants != nil {
+		namedTypes, names, err = findTypes(args.ident, constants)
+		if err != nil {
+			return err
+		}
+	}
+
+	gf := btf.NewGoFormatter(names)
+	gf.Identifier = identifier
+
 	ctx := struct {
-		Module   string
-		Package  string
-		Tags     []string
-		Name     templateName
-		Maps     map[string]string
-		Programs map[string]string
-		Bytes    string
+		*btf.GoFormatter
+		Module    string
+		Package   string
+		Tags      []string
+		Name      templateName
+		Maps      map[string]string
+		Programs  map[string]string
+		Constants *btf.Datasec
+		Types     []btf.NamedType
+		TypeNames map[btf.Type]string
+		Bytes     string
 	}{
+		gf,
 		ebpfModule,
 		args.pkg,
 		args.tags,
 		templateName(args.ident),
 		maps,
 		programs,
+		constants,
+		namedTypes,
+		names,
 		binaryString(obj),
 	}
 
@@ -266,6 +326,81 @@ func writeCommon(args writeArgs) error {
 	}
 
 	return writeFormatted(buf.Bytes(), args.out)
+}
+
+// globalVarTypes returns the types of global non-static variables section.
+//
+// Each type is only returned once.
+func globalVarTypes(section *btf.Datasec) ([]btf.Type, error) {
+	var types []btf.Type
+	seen := make(map[btf.Type]bool)
+	for _, vsi := range section.Vars {
+		v := vsi.Type.(*btf.Var)
+
+		if v.Linkage != btf.GlobalVar {
+			continue
+		}
+
+		typ, err := btf.SkipQualifiers(v.Type)
+		if err != nil {
+			return nil, err
+		}
+
+		if seen[typ] {
+			continue
+		}
+
+		types = append(types, typ)
+		seen[typ] = true
+	}
+	return types, nil
+}
+
+// namedTypes returns all types that have a name.
+//
+// Types and typedefs are skipped if a Go primitive exists.
+func namedTypes(types []btf.Type) ([]btf.NamedType, error) {
+	var named []btf.NamedType
+	for _, typ := range types {
+		namedTyp, ok := typ.(btf.NamedType)
+		if !ok {
+			continue
+		}
+
+		underlying, err := btf.SkipQualifiersAndTypedefs(namedTyp)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, ok := underlying.(*btf.Int); ok {
+			// Don't redefine ints, we want to use the builtin types.
+			continue
+		}
+
+		if name := namedTyp.TypeName(); name != "" {
+			named = append(named, namedTyp)
+		}
+	}
+	return named, nil
+}
+
+func findTypes(prefix string, section *btf.Datasec) ([]btf.NamedType, map[btf.Type]string, error) {
+	types, err := globalVarTypes(section)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	predeclared, err := namedTypes(types)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	names := make(map[btf.Type]string)
+	for _, typ := range predeclared {
+		names[typ] = prefix + identifier(typ.TypeName())
+	}
+
+	return predeclared, names, nil
 }
 
 func binaryString(buf []byte) string {

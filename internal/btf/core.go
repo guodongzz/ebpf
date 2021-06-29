@@ -264,7 +264,7 @@ var errImpossibleRelocation = errors.New("impossible relocation")
 // the better the target is.
 func coreCalculateFixups(local Type, targets []NamedType, relos coreRelos) ([]COREFixup, error) {
 	localID := local.ID()
-	local, err := copyType(local, skipQualifiersAndTypedefs)
+	local, err := copyType(local, SkipQualifiersAndTypedefs)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +273,7 @@ func coreCalculateFixups(local Type, targets []NamedType, relos coreRelos) ([]CO
 	var bestFixups []COREFixup
 	for i := range targets {
 		targetID := targets[i].ID()
-		target, err := copyType(targets[i], skipQualifiersAndTypedefs)
+		target, err := copyType(targets[i], SkipQualifiersAndTypedefs)
 		if err != nil {
 			return nil, err
 		}
@@ -871,7 +871,7 @@ func coreAreMembersCompatible(localType Type, targetType Type) error {
 	}
 }
 
-func skipQualifiersAndTypedefs(typ Type) (Type, error) {
+func SkipQualifiersAndTypedefs(typ Type) (Type, error) {
 	result := typ
 	for depth := 0; depth <= maxTypeDepth; depth++ {
 		switch v := (result).(type) {

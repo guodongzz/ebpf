@@ -4,11 +4,11 @@ import (
 	"fmt"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-9 example ../testdata/minimal.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-11 example ../testdata/minimal.c
 
 func main() {
 	var objs exampleObjects
-	if err := loadExampleObjects(&objs, nil); err != nil {
+	if err := loadExampleObjects(&objs, nil, nil); err != nil {
 		panic("Can't load objects: " + err.Error())
 	}
 	defer objs.Close()
