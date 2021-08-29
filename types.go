@@ -90,9 +90,9 @@ const (
 	SkStorage
 	// DevMapHash - Hash-based indexing scheme for references to network devices.
 	DevMapHash
-	// StructOps - This map holds a kernel struct with its function pointer implemented in a BPF
+	// StructOpsMap - This map holds a kernel struct with its function pointer implemented in a BPF
 	// program.
-	StructOpts
+	StructOpsMap
 	// RingBuf - Similar to PerfEventArray, but shared across all CPUs.
 	RingBuf
 	// InodeStorage - Specialized local storage map for inodes.
@@ -102,6 +102,12 @@ const (
 	// maxMapType - Bound enum of MapTypes, has to be last in enum.
 	maxMapType
 )
+
+// Deprecated: StructOpts was a typo, use StructOpsMap instead.
+//
+// Declared as a variable to prevent stringer from picking it up
+// as an enum value.
+var StructOpts MapType = StructOpsMap
 
 // hasPerCPUValue returns true if the Map stores a value per CPU.
 func (mt MapType) hasPerCPUValue() bool {
@@ -122,6 +128,11 @@ func (mt MapType) canStoreProgram() bool {
 
 // ProgramType of the eBPF program
 type ProgramType uint32
+
+// Max return the latest supported ProgramType.
+func (_ ProgramType) Max() ProgramType {
+	return maxProgramType - 1
+}
 
 // eBPF program types
 const (
@@ -156,6 +167,7 @@ const (
 	Extension
 	LSM
 	SkLookup
+	maxProgramType
 )
 
 // AttachType of the eBPF program, needed to differentiate allowed context accesses in

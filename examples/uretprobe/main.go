@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 // This program demonstrates how to attach an eBPF program to a uretprobe.
@@ -65,7 +66,7 @@ func main() {
 
 	// Open a Uretprobe at the exit point of the symbol and attach
 	// the pre-compiled eBPF program to it.
-	up, err := ex.Uretprobe(symbol, objs.UretprobeBashReadline)
+	up, err := ex.Uretprobe(symbol, objs.UretprobeBashReadline, nil)
 	if err != nil {
 		log.Fatalf("creating uretprobe: %s", err)
 	}
