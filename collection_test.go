@@ -1,11 +1,14 @@
 package ebpf
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/testutils"
 )
 
@@ -23,7 +26,7 @@ func TestCollectionSpecNotModified(t *testing.T) {
 			"test": {
 				Type: SocketFilter,
 				Instructions: asm.Instructions{
-					asm.LoadImm(asm.R1, 0, asm.DWord),
+					asm.LoadImm(asm.R1, 0, asm.DWord).WithReference("my-map"),
 					asm.LoadImm(asm.R0, 0, asm.DWord),
 					asm.Return(),
 				},
@@ -31,8 +34,6 @@ func TestCollectionSpecNotModified(t *testing.T) {
 			},
 		},
 	}
-
-	cs.Programs["test"].Instructions[0].Reference = "my-map"
 
 	coll, err := NewCollection(&cs)
 	if err != nil {
@@ -66,6 +67,7 @@ func TestCollectionSpecCopy(t *testing.T) {
 				License: "MIT",
 			},
 		},
+		Types: &btf.Spec{},
 	}
 	cpy := cs.Copy()
 
@@ -80,12 +82,40 @@ func TestCollectionSpecCopy(t *testing.T) {
 	if cpy.Programs["test"] == cs.Programs["test"] {
 		t.Error("Copy returned same Programs")
 	}
+
+	if cpy.Types != cs.Types {
+		t.Error("Copy returned different Types")
+	}
+}
+
+func TestCollectionSpecLoadCopy(t *testing.T) {
+	file := fmt.Sprintf("testdata/loader-%s.elf", internal.ClangEndian)
+	spec, err := LoadCollectionSpec(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spec2 := spec.Copy()
+
+	var objs struct {
+		Prog *Program `ebpf:"xdp_prog"`
+	}
+
+	err = spec.LoadAndAssign(&objs, nil)
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal("Loading original spec:", err)
+	}
+
+	if err := spec2.LoadAndAssign(&objs, nil); err != nil {
+		t.Fatal("Loading copied spec:", err)
+	}
 }
 
 func TestCollectionSpecRewriteMaps(t *testing.T) {
 	insns := asm.Instructions{
 		// R1 map
-		asm.LoadMapPtr(asm.R1, 0),
+		asm.LoadMapPtr(asm.R1, 0).WithReference("test-map"),
 		// R2 key
 		asm.Mov.Reg(asm.R2, asm.R10),
 		asm.Add.Imm(asm.R2, -4),
@@ -94,9 +124,8 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 		asm.FnMapLookupElem.Call(),
 		asm.JEq.Imm(asm.R0, 0, "ret"),
 		asm.LoadMem(asm.R0, asm.R0, 0, asm.Word),
-		asm.Return().Sym("ret"),
+		asm.Return().WithSymbol("ret"),
 	}
-	insns[0].Reference = "test-map"
 
 	cs := &CollectionSpec{
 		Maps: map[string]*MapSpec{
@@ -153,6 +182,144 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 
 	if ret != 2 {
 		t.Fatal("new / override map not used")
+	}
+}
+
+func TestCollectionSpecMapReplacements(t *testing.T) {
+	insns := asm.Instructions{
+		// R1 map
+		asm.LoadMapPtr(asm.R1, 0).WithReference("test-map"),
+		// R2 key
+		asm.Mov.Reg(asm.R2, asm.R10),
+		asm.Add.Imm(asm.R2, -4),
+		asm.StoreImm(asm.R2, 0, 0, asm.Word),
+		// Lookup map[0]
+		asm.FnMapLookupElem.Call(),
+		asm.JEq.Imm(asm.R0, 0, "ret"),
+		asm.LoadMem(asm.R0, asm.R0, 0, asm.Word),
+		asm.Return().WithSymbol("ret"),
+	}
+
+	cs := &CollectionSpec{
+		Maps: map[string]*MapSpec{
+			"test-map": {
+				Type:       Array,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1,
+			},
+		},
+		Programs: map[string]*ProgramSpec{
+			"test-prog": {
+				Type:         SocketFilter,
+				Instructions: insns,
+				License:      "MIT",
+			},
+		},
+	}
+
+	// Replace the map with another one
+	newMap, err := NewMap(cs.Maps["test-map"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newMap.Close()
+
+	err = newMap.Put(uint32(0), uint32(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+		MapReplacements: map[string]*Map{
+			"test-map": newMap,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coll.Close()
+
+	ret, _, err := coll.Programs["test-prog"].Test(make([]byte, 14))
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ret != 2 {
+		t.Fatal("new / override map not used")
+	}
+
+	// Check that newMap isn't closed when the collection is closed
+	coll.Close()
+	err = newMap.Put(uint32(0), uint32(3))
+	if err != nil {
+		t.Fatalf("failed to update replaced map: %s", err)
+	}
+}
+func TestCollectionSpecMapReplacements_NonExistingMap(t *testing.T) {
+	cs := &CollectionSpec{
+		Maps: map[string]*MapSpec{
+			"test-map": {
+				Type:       Array,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1,
+			},
+		},
+	}
+
+	// Override non-existing map
+	newMap, err := NewMap(cs.Maps["test-map"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newMap.Close()
+
+	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+		MapReplacements: map[string]*Map{
+			"non-existing-map": newMap,
+		},
+	})
+	if err == nil {
+		coll.Close()
+		t.Fatal("Overriding a non existing map did not fail")
+	}
+}
+
+func TestCollectionSpecMapReplacements_SpecMismatch(t *testing.T) {
+	cs := &CollectionSpec{
+		Maps: map[string]*MapSpec{
+			"test-map": {
+				Type:       Array,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1,
+			},
+		},
+	}
+
+	// Override map with mismatching spec
+	newMap, err := NewMap(&MapSpec{
+		Type:       Array,
+		KeySize:    4,
+		ValueSize:  8, // this is different
+		MaxEntries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll, err := NewCollectionWithOptions(cs, CollectionOptions{
+		MapReplacements: map[string]*Map{
+			"test-map": newMap,
+		},
+	})
+	if err == nil {
+		coll.Close()
+		t.Fatal("Overriding a map with a mismatching spec did not fail")
+	}
+	if !errors.Is(err, ErrMapIncompatible) {
+		t.Fatalf("Overriding a map with a mismatching spec failed with the wrong error")
 	}
 }
 
@@ -265,48 +432,11 @@ func TestCollectionAssign(t *testing.T) {
 	if err := cs.Assign(unexported); err == nil {
 		t.Error("Assign should return an error on unexported fields")
 	}
-
-	coll, err := NewCollection(cs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer coll.Close()
-
-	var objs struct {
-		Program *Program `ebpf:"prog1"`
-		Map     *Map     `ebpf:"map1"`
-	}
-
-	prog1 := coll.Programs["prog1"]
-	defer prog1.Close()
-
-	map1 := coll.Maps["map1"]
-	defer map1.Close()
-
-	if err := coll.Assign(&objs); err != nil {
-		t.Fatal("Can't Assign objects:", err)
-	}
-
-	if objs.Program != prog1 {
-		t.Errorf("Program is %p not %p", objs.Program, prog1)
-	}
-
-	if objs.Map != map1 {
-		t.Errorf("Map is %p not %p", objs.Map, map1)
-	}
-
-	if coll.Programs["prog1"] != nil {
-		t.Fatal("Assign doesn't detach Program")
-	}
-
-	if coll.Maps["map1"] != nil {
-		t.Fatal("Assign doesn't detach Map")
-	}
 }
 
 func TestAssignValues(t *testing.T) {
-	zero := func(t reflect.Type, name string) (reflect.Value, error) {
-		return reflect.Zero(t), nil
+	zero := func(t reflect.Type, name string) (interface{}, error) {
+		return reflect.Zero(t).Interface(), nil
 	}
 
 	type t1 struct {
@@ -440,51 +570,6 @@ func ExampleCollectionSpec_LoadAndAssign() {
 	}
 
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		panic(err)
-	}
-
-	fmt.Println(objs.Program.Type())
-	fmt.Println(objs.Map.Type())
-
-	// Output: SocketFilter
-	// Array
-}
-
-func ExampleCollection_Assign() {
-	coll, err := NewCollection(&CollectionSpec{
-		Maps: map[string]*MapSpec{
-			"map1": {
-				Type:       Array,
-				KeySize:    4,
-				ValueSize:  4,
-				MaxEntries: 1,
-			},
-		},
-		Programs: map[string]*ProgramSpec{
-			"prog1": {
-				Type: SocketFilter,
-				Instructions: asm.Instructions{
-					asm.LoadImm(asm.R0, 0, asm.DWord),
-					asm.Return(),
-				},
-				License: "MIT",
-			},
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	type maps struct {
-		Map *Map `ebpf:"map1"`
-	}
-
-	var objs struct {
-		maps
-		Program *Program `ebpf:"prog1"`
-	}
-
-	if err := coll.Assign(&objs); err != nil {
 		panic(err)
 	}
 

@@ -2,27 +2,59 @@ package main
 
 import (
 	"testing"
+
+	"github.com/cilium/ebpf/btf"
+	qt "github.com/frankban/quicktest"
 )
 
-func TestIdentifier(t *testing.T) {
-	testcases := []struct {
-		in, out string
+func TestOrderTypes(t *testing.T) {
+	a := &btf.Int{}
+	b := &btf.Int{}
+	c := &btf.Int{}
+
+	for _, test := range []struct {
+		name string
+		in   map[btf.Type]string
+		out  []btf.Type
 	}{
-		{".rodata", "Rodata"},
-		{"_foo_bar_", "FooBar"},
-		{"ipv6_test", "Ipv6Test"},
-		{"FOO_BAR", "FOO_BAR"},
-		{"FOO_", "FOO_"},
-		{"FOO__BAR", "FOO__BAR"},
-		{"FOO___BAR", "FOO___BAR"},
-		{"_FOO__BAR", "FOO__BAR"},
-		{"__FOO__BAR", "FOO__BAR"},
+		{
+			"order",
+			map[btf.Type]string{
+				a: "foo",
+				b: "bar",
+				c: "baz",
+			},
+			[]btf.Type{b, c, a},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := sortTypes(test.in)
+			qt.Assert(t, err, qt.IsNil)
+			qt.Assert(t, len(result), qt.Equals, len(test.out))
+			for i, o := range test.out {
+				if result[i] != o {
+					t.Fatalf("Index %d: expected %p got %p", i, o, result[i])
+				}
+			}
+		})
 	}
 
-	for _, tc := range testcases {
-		have := identifier(tc.in)
-		if have != tc.out {
-			t.Errorf("Expected %q as output of %q, got %q", tc.out, tc.in, have)
-		}
+	for _, test := range []struct {
+		name string
+		in   map[btf.Type]string
+	}{
+		{
+			"duplicate names",
+			map[btf.Type]string{
+				a: "foo",
+				b: "foo",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := sortTypes(test.in)
+			qt.Assert(t, err, qt.IsNotNil)
+			qt.Assert(t, result, qt.IsNil)
+		})
 	}
 }

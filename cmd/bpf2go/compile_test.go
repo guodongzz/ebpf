@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,12 +11,17 @@ import (
 
 const minimalSocketFilter = `__attribute__((section("socket"), used)) int main() { return 0; }`
 
+// Test against the minimum supported version of clang to avoid regressions.
+const (
+	clangBin = "clang-9"
+)
+
 func TestCompile(t *testing.T) {
 	dir := mustWriteTempFile(t, "test.c", minimalSocketFilter)
 
 	var dep bytes.Buffer
 	err := compile(compileArgs{
-		cc:     "clang-9",
+		cc:     clangBin,
 		dir:    dir,
 		source: filepath.Join(dir, "test.c"),
 		dest:   filepath.Join(dir, "test.o"),
@@ -49,7 +53,7 @@ func TestReproducibleCompile(t *testing.T) {
 	dir := mustWriteTempFile(t, "test.c", minimalSocketFilter)
 
 	err := compile(compileArgs{
-		cc:     "clang-9",
+		cc:     clangBin,
 		dir:    dir,
 		source: filepath.Join(dir, "test.c"),
 		dest:   filepath.Join(dir, "a.o"),
@@ -59,7 +63,7 @@ func TestReproducibleCompile(t *testing.T) {
 	}
 
 	err = compile(compileArgs{
-		cc:     "clang-9",
+		cc:     clangBin,
 		dir:    dir,
 		source: filepath.Join(dir, "test.c"),
 		dest:   filepath.Join(dir, "b.o"),
@@ -68,12 +72,12 @@ func TestReproducibleCompile(t *testing.T) {
 		t.Fatal("Can't compile:", err)
 	}
 
-	aBytes, err := ioutil.ReadFile(filepath.Join(dir, "a.o"))
+	aBytes, err := os.ReadFile(filepath.Join(dir, "a.o"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	bBytes, err := ioutil.ReadFile(filepath.Join(dir, "b.o"))
+	bBytes, err := os.ReadFile(filepath.Join(dir, "b.o"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +91,7 @@ func TestTriggerMissingTarget(t *testing.T) {
 	dir := mustWriteTempFile(t, "test.c", `_Pragma(__BPF_TARGET_MISSING);`)
 
 	err := compile(compileArgs{
-		cc:     "clang-9",
+		cc:     clangBin,
 		dir:    dir,
 		source: filepath.Join(dir, "test.c"),
 		dest:   filepath.Join(dir, "a.o"),
@@ -151,14 +155,14 @@ nothing:
 func mustWriteTempFile(t *testing.T, name, contents string) string {
 	t.Helper()
 
-	tmp, err := ioutil.TempDir("", "bpf2go")
+	tmp, err := os.MkdirTemp("", "bpf2go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(tmp) })
 
 	tmpFile := filepath.Join(tmp, name)
-	if err := ioutil.WriteFile(tmpFile, []byte(contents), 0660); err != nil {
+	if err := os.WriteFile(tmpFile, []byte(contents), 0660); err != nil {
 		t.Fatal(err)
 	}
 

@@ -1,30 +1,17 @@
 package link
 
 import (
-	"io/ioutil"
+	"io"
 	"testing"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal/testutils"
 )
 
 func TestIter(t *testing.T) {
-	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
-		Type:       ebpf.Tracing,
-		AttachType: ebpf.AttachTraceIter,
-		AttachTo:   "bpf_map",
-		Instructions: asm.Instructions{
-			asm.Mov.Imm(asm.R0, 0),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	testutils.SkipIfNotSupported(t, err)
-	if err != nil {
-		t.Fatal("Can't load program:", err)
-	}
-	defer prog.Close()
+	testutils.SkipOnOldKernel(t, "5.9", "bpf_map iter")
+
+	prog := mustLoadProgram(t, ebpf.Tracing, ebpf.AttachTraceIter, "bpf_map")
 
 	it, err := AttachIter(IterOptions{
 		Program: prog,
@@ -39,7 +26,7 @@ func TestIter(t *testing.T) {
 	}
 	defer file.Close()
 
-	contents, err := ioutil.ReadAll(file)
+	contents, err := io.ReadAll(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,30 +35,13 @@ func TestIter(t *testing.T) {
 		t.Error("Non-empty output from no-op iterator:", string(contents))
 	}
 
-	testLink(t, it, testLinkOptions{
-		prog: prog,
-		loadPinned: func(s string, opts *ebpf.LoadPinOptions) (Link, error) {
-			return LoadPinnedIter(s, opts)
-		},
-	})
+	testLink(t, it, prog)
 }
 
 func TestIterMapElements(t *testing.T) {
-	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
-		Type:       ebpf.Tracing,
-		AttachType: ebpf.AttachTraceIter,
-		AttachTo:   "bpf_map_elem",
-		Instructions: asm.Instructions{
-			asm.Mov.Imm(asm.R0, 0),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	testutils.SkipIfNotSupported(t, err)
-	if err != nil {
-		t.Fatal("Can't load program:", err)
-	}
-	defer prog.Close()
+	testutils.SkipOnOldKernel(t, "5.9", "bpf_map_elem iter")
+
+	prog := mustLoadProgram(t, ebpf.Tracing, ebpf.AttachTraceIter, "bpf_map_elem")
 
 	arr, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Array,
@@ -99,7 +69,7 @@ func TestIterMapElements(t *testing.T) {
 	}
 	defer file.Close()
 
-	contents, err := ioutil.ReadAll(file)
+	contents, err := io.ReadAll(file)
 	if err != nil {
 		t.Fatal(err)
 	}

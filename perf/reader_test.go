@@ -3,6 +3,7 @@ package perf
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -14,6 +15,8 @@ import (
 	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
+
+	qt "github.com/frankban/quicktest"
 )
 
 var (
@@ -116,6 +119,9 @@ func outputSamplesProg(sampleSizes ...int) (*ebpf.Program, *ebpf.Map, error) {
 
 func mustOutputSamplesProg(tb testing.TB, sampleSizes ...int) (*ebpf.Program, *ebpf.Map) {
 	tb.Helper()
+
+	// Requires at least 4.9 (0515e5999a46 "bpf: introduce BPF_PROG_TYPE_PERF_EVENT program type")
+	testutils.SkipOnOldKernel(tb, "4.9", "perf events support")
 
 	prog, events, err := outputSamplesProg(sampleSizes...)
 	if err != nil {
@@ -288,7 +294,8 @@ func TestReadRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = readRecord(&buf, 0)
+	var rec Record
+	err = readRecord(&buf, &rec, make([]byte, perfEventHeaderSize))
 	if !IsUnknownEvent(err) {
 		t.Error("readRecord should return unknown event error, got", err)
 	}
@@ -371,12 +378,13 @@ func TestPause(t *testing.T) {
 	}
 
 	// Pause/Resume after close should be no-op.
-	if err = rd.Pause(); err != errClosed {
-		t.Fatalf("Unexpected error: %s", err)
-	}
-	if err = rd.Resume(); err != errClosed {
-		t.Fatalf("Unexpected error: %s", err)
-	}
+	err = rd.Pause()
+	qt.Assert(t, err, qt.Not(qt.Equals), ErrClosed, qt.Commentf("returns unwrapped ErrClosed"))
+	qt.Assert(t, errors.Is(err, ErrClosed), qt.IsTrue, qt.Commentf("doesn't wrap ErrClosed"))
+
+	err = rd.Resume()
+	qt.Assert(t, err, qt.Not(qt.Equals), ErrClosed, qt.Commentf("returns unwrapped ErrClosed"))
+	qt.Assert(t, errors.Is(err, ErrClosed), qt.IsTrue, qt.Commentf("doesn't wrap ErrClosed"))
 }
 
 func BenchmarkReader(b *testing.B) {
@@ -403,6 +411,39 @@ func BenchmarkReader(b *testing.B) {
 		}
 
 		if _, err = rd.Read(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadInto(b *testing.B) {
+	prog, events := mustOutputSamplesProg(b, 80)
+	defer prog.Close()
+	defer events.Close()
+
+	rd, err := NewReader(events, 4096)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer rd.Close()
+
+	buf := make([]byte, 14)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var rec Record
+	for i := 0; i < b.N; i++ {
+		// NB: Submitting samples into the perf event ring dominates
+		// the benchmark time unfortunately.
+		ret, _, err := prog.Test(buf)
+		if err != nil {
+			b.Fatal(err)
+		} else if errno := syscall.Errno(-int32(ret)); errno != 0 {
+			b.Fatal("Expected 0 as return value, got", errno)
+		}
+
+		if err := rd.ReadInto(&rec); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -460,4 +501,34 @@ func ExampleReader() {
 
 	// Data is padded with 0 for alignment
 	fmt.Println("Sample:", record.RawSample)
+}
+
+// ReadRecord allows reducing memory allocations.
+func ExampleReader_ReadInto() {
+	prog, events := bpfPerfEventOutputProgram()
+	defer prog.Close()
+	defer events.Close()
+
+	rd, err := NewReader(events, 4096)
+	if err != nil {
+		panic(err)
+	}
+	defer rd.Close()
+
+	for i := 0; i < 2; i++ {
+		// Write out two samples
+		ret, _, err := prog.Test(make([]byte, 14))
+		if err != nil || ret != 0 {
+			panic("Can't write sample")
+		}
+	}
+
+	var rec Record
+	for i := 0; i < 2; i++ {
+		if err := rd.ReadInto(&rec); err != nil {
+			panic(err)
+		}
+
+		fmt.Println("Sample:", rec.RawSample[:5])
+	}
 }

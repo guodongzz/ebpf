@@ -3,14 +3,16 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
+	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -31,7 +33,7 @@ func TestRun(t *testing.T) {
 		t.Fatal("No go.mod file in", modRoot)
 	}
 
-	tmpDir, err := ioutil.TempDir("", "bpf2go-module-*")
+	tmpDir, err := os.MkdirTemp("", "bpf2go-module-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +62,8 @@ func TestRun(t *testing.T) {
 		fmt.Sprintf("-replace=%s=%s", ebpfModule, modRoot),
 	)
 
-	err = run(ioutil.Discard, "foo", tmpDir, []string{
-		"-cc", "clang-9",
+	err = run(io.Discard, "foo", tmpDir, []string{
+		"-cc", clangBin,
 		"bar",
 		filepath.Join(dir, "test.c"),
 	})
@@ -104,6 +106,22 @@ func TestHelp(t *testing.T) {
 	}
 }
 
+func TestDisableStripping(t *testing.T) {
+	dir := mustWriteTempFile(t, "test.c", minimalSocketFilter)
+
+	err := run(io.Discard, "foo", dir, []string{
+		"-cc", "clang-9",
+		"-strip", "binary-that-certainly-doesnt-exist",
+		"-no-strip",
+		"bar",
+		filepath.Join(dir, "test.c"),
+	})
+
+	if err != nil {
+		t.Fatal("Can't run with stripping disabled:", err)
+	}
+}
+
 func TestCollectTargets(t *testing.T) {
 	clangArches := make(map[string][]string)
 	linuxArchesLE := make(map[string][]string)
@@ -124,6 +142,18 @@ func TestCollectTargets(t *testing.T) {
 	}
 	for i := range linuxArchesBE {
 		sort.Strings(linuxArchesBE[i])
+	}
+
+	nativeTarget := make(map[target][]string)
+	for arch, archTarget := range targetByGoArch {
+		if arch == runtime.GOARCH {
+			if archTarget.clang == "bpfel" {
+				nativeTarget[archTarget] = linuxArchesLE[archTarget.linux]
+			} else {
+				nativeTarget[archTarget] = linuxArchesBE[archTarget.linux]
+			}
+			break
+		}
 	}
 
 	tests := []struct {
@@ -150,6 +180,10 @@ func TestCollectTargets(t *testing.T) {
 				{"bpfeb", "arm64"}: linuxArchesBE["arm64"],
 				{"bpfel", "x86"}:   linuxArchesLE["x86"],
 			},
+		},
+		{
+			[]string{"native"},
+			nativeTarget,
 		},
 	}
 
@@ -197,15 +231,50 @@ func TestConvertGOARCH(t *testing.T) {
 	)
 
 	b2g := bpf2go{
-		pkg:        "test",
-		stdout:     ioutil.Discard,
-		ident:      "test",
-		cc:         "clang-9",
-		sourceFile: tmp + "/test.c",
-		outputDir:  tmp,
+		pkg:              "test",
+		stdout:           io.Discard,
+		ident:            "test",
+		cc:               clangBin,
+		disableStripping: true,
+		sourceFile:       tmp + "/test.c",
+		outputDir:        tmp,
 	}
 
 	if err := b2g.convert(targetByGoArch["amd64"], nil); err != nil {
 		t.Fatal("Can't target GOARCH:", err)
 	}
+}
+
+func TestCTypes(t *testing.T) {
+	var ct cTypes
+	valid := []string{
+		"abcdefghijklmnopqrstuvqxyABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890_",
+		"y",
+	}
+	for _, value := range valid {
+		if err := ct.Set(value); err != nil {
+			t.Fatalf("Set returned an error for %q: %s", value, err)
+		}
+	}
+	qt.Assert(t, ct, qt.ContentEquals, cTypes(valid))
+
+	for _, value := range []string{
+		"",
+		" ",
+		" frood",
+		"foo\nbar",
+		".",
+		",",
+		"+",
+		"-",
+	} {
+		ct = nil
+		if err := ct.Set(value); err == nil {
+			t.Fatalf("Set did not return an error for %q", value)
+		}
+	}
+
+	ct = nil
+	qt.Assert(t, ct.Set("foo"), qt.IsNil)
+	qt.Assert(t, ct.Set("foo"), qt.IsNotNil)
 }

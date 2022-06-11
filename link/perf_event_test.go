@@ -27,7 +27,8 @@ func TestTraceEventTypePMU(t *testing.T) {
 func TestTraceEventID(t *testing.T) {
 	c := qt.New(t)
 
-	eid, err := getTraceEventID("syscalls", "sys_enter_execve")
+	// using sys_enter_mkdir here as it exist in old kernel (< 4.9) as well
+	eid, err := getTraceEventID("syscalls", "sys_enter_mkdir")
 	c.Assert(err, qt.IsNil)
 	c.Assert(eid, qt.Not(qt.Equals), 0)
 }
@@ -44,8 +45,8 @@ func TestTraceReadID(t *testing.T) {
 	}
 }
 
-func TestTraceEventRegex(t *testing.T) {
-	var tests = []struct {
+func TestTraceValidID(t *testing.T) {
+	tests := []struct {
 		name string
 		in   string
 		fail bool
@@ -66,9 +67,13 @@ func TestTraceEventRegex(t *testing.T) {
 				exp = "fail"
 			}
 
-			if rgxTraceEvent.MatchString(tt.in) == tt.fail {
-				t.Errorf("expected string '%s' to %s regex match", tt.in, exp)
+			if isValidTraceID(tt.in) == tt.fail {
+				t.Errorf("expected string '%s' to %s valid ID check", tt.in, exp)
 			}
 		})
 	}
+}
+
+func TestHaveBPFLinkPerfEvent(t *testing.T) {
+	testutils.CheckFeatureTest(t, haveBPFLinkPerfEvent)
 }

@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"testing"
 
@@ -29,7 +30,19 @@ func TestRead64bitImmediate(t *testing.T) {
 	}
 
 	if c := ins.Constant; c != math.MinInt32-1 {
-		t.Errorf("Expected immediate to be %v, got %v", math.MinInt32-1, c)
+		t.Errorf("Expected immediate to be %v, got %v", int64(math.MinInt32)-1, c)
+	}
+}
+
+func BenchmarkRead64bitImmediate(b *testing.B) {
+	r := &bytes.Reader{}
+	for i := 0; i < b.N; i++ {
+		r.Reset(test64bitImmProg)
+
+		var ins Instruction
+		if _, err := ins.Unmarshal(r, binary.LittleEndian); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -48,6 +61,39 @@ func TestWrite64bitImmediate(t *testing.T) {
 	}
 }
 
+func BenchmarkWrite64BitImmediate(b *testing.B) {
+	ins := LoadImm(R0, math.MinInt32-1, DWord)
+
+	var buf bytes.Buffer
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+
+		if _, err := ins.Marshal(&buf, binary.LittleEndian); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestUnmarshalInstructions(t *testing.T) {
+	r := bytes.NewReader(test64bitImmProg)
+
+	var insns Instructions
+	if err := insns.Unmarshal(r, binary.LittleEndian); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unmarshaling into the same Instructions multiple times replaces
+	// the instruction stream.
+	r.Reset(test64bitImmProg)
+	if err := insns.Unmarshal(r, binary.LittleEndian); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(insns) != 1 {
+		t.Fatalf("Expected one instruction, got %d", len(insns))
+	}
+}
+
 func TestSignedJump(t *testing.T) {
 	insns := Instructions{
 		JSGT.Imm(R0, -1, "foo"),
@@ -55,7 +101,7 @@ func TestSignedJump(t *testing.T) {
 
 	insns[0].Offset = 1
 
-	err := insns.Marshal(ioutil.Discard, binary.LittleEndian)
+	err := insns.Marshal(io.Discard, binary.LittleEndian)
 	if err != nil {
 		t.Error("Can't marshal signed jump:", err)
 	}
@@ -96,7 +142,7 @@ func TestInstructionLoadMapValue(t *testing.T) {
 	if !ins.IsLoadFromMap() {
 		t.Error("isLoadFromMap returns false")
 	}
-	if fd := ins.MapPtr(); fd != 1 {
+	if fd := ins.mapFd(); fd != 1 {
 		t.Error("Expected map fd to be 1, got", fd)
 	}
 	if off := ins.mapOffset(); off != 123 {
@@ -106,10 +152,9 @@ func TestInstructionLoadMapValue(t *testing.T) {
 
 func TestInstructionsRewriteMapPtr(t *testing.T) {
 	insns := Instructions{
-		LoadMapPtr(R1, 0),
+		LoadMapPtr(R1, 0).WithReference("good"),
 		Return(),
 	}
-	insns[0].Reference = "good"
 
 	if err := insns.RewriteMapPtr("good", 1); err != nil {
 		t.Fatal(err)
@@ -127,7 +172,7 @@ func TestInstructionsRewriteMapPtr(t *testing.T) {
 		t.Error("Constant should be 2, have", insns[0].Constant)
 	}
 
-	if err := insns.RewriteMapPtr("bad", 1); !IsUnreferencedSymbol(err) {
+	if err := insns.RewriteMapPtr("bad", 1); !errors.Is(err, ErrUnreferencedSymbol) {
 		t.Error("Rewriting unreferenced map doesn't return appropriate error")
 	}
 }
@@ -135,9 +180,10 @@ func TestInstructionsRewriteMapPtr(t *testing.T) {
 // You can use format flags to change the way an eBPF
 // program is stringified.
 func ExampleInstructions_Format() {
+
 	insns := Instructions{
-		FnMapLookupElem.Call().Sym("my_func"),
-		LoadImm(R0, 42, DWord),
+		FnMapLookupElem.Call().WithSymbol("my_func").WithSource(Comment("bpf_map_lookup_elem()")),
+		LoadImm(R0, 42, DWord).WithSource(Comment("abc = 42")),
 		Return(),
 	}
 
@@ -155,25 +201,33 @@ func ExampleInstructions_Format() {
 
 	// Output: Default format:
 	// my_func:
+	//	 ; bpf_map_lookup_elem()
 	// 	0: Call FnMapLookupElem
+	//	 ; abc = 42
 	// 	1: LdImmDW dst: r0 imm: 42
 	// 	3: Exit
 	//
 	// Don't indent instructions:
 	// my_func:
+	//  ; bpf_map_lookup_elem()
 	// 0: Call FnMapLookupElem
+	//  ; abc = 42
 	// 1: LdImmDW dst: r0 imm: 42
 	// 3: Exit
 	//
 	// Indent using spaces:
 	// my_func:
+	//   ; bpf_map_lookup_elem()
 	//  0: Call FnMapLookupElem
+	//   ; abc = 42
 	//  1: LdImmDW dst: r0 imm: 42
 	//  3: Exit
 	//
 	// Control symbol indentation:
 	// 		my_func:
+	//	 ; bpf_map_lookup_elem()
 	// 	0: Call FnMapLookupElem
+	//	 ; abc = 42
 	// 	1: LdImmDW dst: r0 imm: 42
 	// 	3: Exit
 }
@@ -234,4 +288,41 @@ func TestInstructionIterator(t *testing.T) {
 			t.Errorf("Expected iter.Offset to be %d, got %d", offsets[i], iter.Offset)
 		}
 	}
+}
+
+func TestMetadataCopyOnWrite(t *testing.T) {
+	c := qt.New(t)
+
+	// Setting metadata should copy Instruction and modify the metadata pointer
+	// of the new object without touching the old Instruction.
+
+	// Reference
+	ins := Ja.Label("my_func")
+	ins2 := ins.WithReference("my_func2")
+
+	c.Assert(ins.Reference(), qt.Equals, "my_func", qt.Commentf("WithReference updated ins"))
+	c.Assert(ins2.Reference(), qt.Equals, "my_func2", qt.Commentf("WithReference didn't update ins2"))
+
+	// Symbol
+	ins = Ja.Label("").WithSymbol("my_sym")
+	ins2 = ins.WithSymbol("my_sym2")
+
+	c.Assert(ins.Symbol(), qt.Equals, "my_sym", qt.Commentf("WithSymbol updated ins"))
+	c.Assert(ins2.Symbol(), qt.Equals, "my_sym2", qt.Commentf("WithSymbol didn't update ins2"))
+
+	// Map
+	ins = LoadMapPtr(R1, 0)
+	ins2 = ins
+
+	testMap := testFDer(1)
+	c.Assert(ins2.AssociateMap(testMap), qt.IsNil, qt.Commentf("failed to associate map with ins2"))
+
+	c.Assert(ins.Map(), qt.IsNil, qt.Commentf("AssociateMap updated ins"))
+	c.Assert(ins2.Map(), qt.Equals, testMap, qt.Commentf("AssociateMap didn't update ins2"))
+}
+
+type testFDer int
+
+func (t testFDer) FD() int {
+	return int(t)
 }

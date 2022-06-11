@@ -6,39 +6,21 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 
 	qt "github.com/frankban/quicktest"
 )
 
-var (
-	tracepointSpec = ebpf.ProgramSpec{
-		Type:    ebpf.TracePoint,
-		License: "MIT",
-		Instructions: asm.Instructions{
-			// set exit code to 0
-			asm.Mov.Imm(asm.R0, 0),
-			asm.Return(),
-		},
-	}
-)
-
 func TestTracepoint(t *testing.T) {
-
 	// Requires at least 4.7 (98b5c2c65c29 "perf, bpf: allow bpf programs attach to tracepoints")
 	testutils.SkipOnOldKernel(t, "4.7", "tracepoint support")
 
-	prog, err := ebpf.NewProgram(&tracepointSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.TracePoint, 0, "")
 
 	// printk is guaranteed to be present.
 	// Kernels before 4.14 don't support attaching to syscall tracepoints.
-	tp, err := Tracepoint("printk", "console", prog)
+	tp, err := Tracepoint("printk", "console", prog, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,13 +31,12 @@ func TestTracepoint(t *testing.T) {
 }
 
 func TestTracepointMissing(t *testing.T) {
-	prog, err := ebpf.NewProgram(&tracepointSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	// Requires at least 4.7 (98b5c2c65c29 "perf, bpf: allow bpf programs attach to tracepoints")
+	testutils.SkipOnOldKernel(t, "4.7", "tracepoint support")
 
-	_, err = Tracepoint("missing", "foobazbar", prog)
+	prog := mustLoadProgram(t, ebpf.TracePoint, 0, "")
+
+	_, err := Tracepoint("missing", "foobazbar", prog, nil)
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Error("Expected os.ErrNotExist, got", err)
 	}
@@ -65,16 +46,16 @@ func TestTracepointErrors(t *testing.T) {
 	c := qt.New(t)
 
 	// Invalid Tracepoint incantations.
-	_, err := Tracepoint("", "", nil) // empty names
+	_, err := Tracepoint("", "", nil, nil) // empty names
 	c.Assert(errors.Is(err, errInvalidInput), qt.IsTrue)
 
-	_, err = Tracepoint("_", "_", nil) // empty prog
+	_, err = Tracepoint("_", "_", nil, nil) // empty prog
 	c.Assert(errors.Is(err, errInvalidInput), qt.IsTrue)
 
-	_, err = Tracepoint(".", "+", &ebpf.Program{}) // illegal chars in group/name
+	_, err = Tracepoint(".", "+", &ebpf.Program{}, nil) // illegal chars in group/name
 	c.Assert(errors.Is(err, errInvalidInput), qt.IsTrue)
 
-	_, err = Tracepoint("foo", "bar", &ebpf.Program{}) // wrong prog type
+	_, err = Tracepoint("foo", "bar", &ebpf.Program{}, nil) // wrong prog type
 	c.Assert(errors.Is(err, errInvalidInput), qt.IsTrue)
 }
 
@@ -98,7 +79,7 @@ func TestTracepointProgramCall(t *testing.T) {
 
 	// Open Tracepoint at /sys/kernel/debug/tracing/events/syscalls/sys_enter_getpid
 	// and attach it to the ebpf program created above.
-	tp, err := Tracepoint("syscalls", "sys_enter_getpid", p)
+	tp, err := Tracepoint("syscalls", "sys_enter_getpid", p, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

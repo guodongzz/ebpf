@@ -4,14 +4,14 @@ import (
 	"github.com/cilium/ebpf/internal/unix"
 )
 
-//go:generate stringer -output types_string.go -type=MapType,ProgramType,AttachType,PinType
+//go:generate stringer -output types_string.go -type=MapType,ProgramType,PinType
 
 // MapType indicates the type map structure
 // that will be initialized in the kernel.
 type MapType uint32
 
 // Max returns the latest supported MapType.
-func (_ MapType) Max() MapType {
+func (MapType) Max() MapType {
 	return maxMapType - 1
 }
 
@@ -103,12 +103,6 @@ const (
 	maxMapType
 )
 
-// Deprecated: StructOpts was a typo, use StructOpsMap instead.
-//
-// Declared as a variable to prevent stringer from picking it up
-// as an enum value.
-var StructOpts MapType = StructOpsMap
-
 // hasPerCPUValue returns true if the Map stores a value per CPU.
 func (mt MapType) hasPerCPUValue() bool {
 	return mt == PerCPUHash || mt == PerCPUArray || mt == LRUCPUHash || mt == PerCPUCGroupStorage
@@ -126,11 +120,22 @@ func (mt MapType) canStoreProgram() bool {
 	return mt == ProgramArray
 }
 
+// hasBTF returns true if the map type supports BTF key/value metadata.
+func (mt MapType) hasBTF() bool {
+	switch mt {
+	case PerfEventArray, CGroupArray, StackTrace, ArrayOfMaps, HashOfMaps, DevMap,
+		DevMapHash, CPUMap, XSKMap, SockMap, SockHash, Queue, Stack, RingBuf:
+		return false
+	default:
+		return true
+	}
+}
+
 // ProgramType of the eBPF program
 type ProgramType uint32
 
 // Max return the latest supported ProgramType.
-func (_ ProgramType) Max() ProgramType {
+func (ProgramType) Max() ProgramType {
 	return maxProgramType - 1
 }
 
@@ -167,6 +172,7 @@ const (
 	Extension
 	LSM
 	SkLookup
+	Syscall
 	maxProgramType
 )
 
@@ -174,6 +180,8 @@ const (
 // some newer program types like CGroupSockAddr. Should be set to AttachNone if not required.
 // Will cause invalid argument (EINVAL) at program load time if set incorrectly.
 type AttachType uint32
+
+//go:generate stringer -type AttachType -trimprefix Attach
 
 // AttachNone is an alias for AttachCGroupInetIngress for readability reasons.
 const AttachNone AttachType = 0
@@ -217,6 +225,10 @@ const (
 	AttachXDPCPUMap
 	AttachSkLookup
 	AttachXDP
+	AttachSkSKBVerdict
+	AttachSkReuseportSelect
+	AttachSkReuseportSelectOrMigrate
+	AttachPerfEvent
 )
 
 // AttachFlags of the eBPF program used in BPF_PROG_ATTACH command

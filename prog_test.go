@@ -17,12 +17,16 @@ import (
 	qt "github.com/frankban/quicktest"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
+	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 )
 
 func TestProgramRun(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "4.8", "XDP program")
+
 	pat := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	buf := make([]byte, 14)
 
@@ -45,7 +49,7 @@ func TestProgramRun(t *testing.T) {
 	}
 	ins = append(ins,
 		// return 42
-		asm.LoadImm(asm.R0, 42, asm.DWord).Sym("out"),
+		asm.LoadImm(asm.R0, 42, asm.DWord).WithSymbol("out"),
 		asm.Return(),
 	)
 
@@ -86,9 +90,54 @@ func TestProgramRun(t *testing.T) {
 	}
 }
 
-func TestProgramBenchmark(t *testing.T) {
-	prog := createSocketFilter(t)
+func TestProgramRunWithOptions(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.15", "XDP ctx_in/ctx_out")
+
+	ins := asm.Instructions{
+		// Return XDP_ABORTED
+		asm.LoadImm(asm.R0, 0, asm.DWord),
+		asm.Return(),
+	}
+
+	prog, err := NewProgram(&ProgramSpec{
+		Name:         "test",
+		Type:         XDP,
+		Instructions: ins,
+		License:      "MIT",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer prog.Close()
+
+	buf := make([]byte, 14)
+	xdp := sys.XdpMd{
+		Data:    0,
+		DataEnd: 14,
+	}
+	xdpOut := sys.XdpMd{}
+	opts := RunOptions{
+		Data:       buf,
+		Context:    xdp,
+		ContextOut: &xdpOut,
+	}
+	ret, err := prog.Run(&opts)
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ret != 0 {
+		t.Error("Expected return value to be 0, got", ret)
+	}
+
+	if xdp != xdpOut {
+		t.Errorf("Expect xdp (%+v) == xdpOut (%+v)", xdp, xdpOut)
+	}
+}
+
+func TestProgramBenchmark(t *testing.T) {
+	prog := mustSocketFilter(t)
 
 	ret, duration, err := prog.Benchmark(make([]byte, 14), 1, nil)
 	testutils.SkipIfNotSupported(t, err)
@@ -108,8 +157,7 @@ func TestProgramBenchmark(t *testing.T) {
 func TestProgramTestRunInterrupt(t *testing.T) {
 	testutils.SkipOnOldKernel(t, "5.0", "EINTR from BPF_PROG_TEST_RUN")
 
-	prog := createSocketFilter(t)
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
 	var (
 		tgid    = unix.Getpid()
@@ -134,13 +182,18 @@ func TestProgramTestRunInterrupt(t *testing.T) {
 
 		// Block this thread in the BPF syscall, so that we can
 		// trigger EINTR by sending a signal.
-		_, _, _, err := prog.testRun(make([]byte, 14), math.MaxInt32, func() {
-			// We don't know how long finishing the
-			// test run would take, so flag that we've seen
-			// an interruption and abort the goroutine.
-			close(errs)
-			runtime.Goexit()
-		})
+		opts := RunOptions{
+			Data:   make([]byte, 14),
+			Repeat: math.MaxInt32,
+			Reset: func() {
+				// We don't know how long finishing the
+				// test run would take, so flag that we've seen
+				// an interruption and abort the goroutine.
+				close(errs)
+				runtime.Goexit()
+			},
+		}
+		_, _, err := prog.testRun(&opts)
 
 		errs <- err
 	}()
@@ -174,7 +227,7 @@ func TestProgramTestRunInterrupt(t *testing.T) {
 }
 
 func TestProgramClose(t *testing.T) {
-	prog := createSocketFilter(t)
+	prog := mustSocketFilter(t)
 
 	if err := prog.Close(); err != nil {
 		t.Fatal("Can't close program:", err)
@@ -182,9 +235,8 @@ func TestProgramClose(t *testing.T) {
 }
 
 func TestProgramPin(t *testing.T) {
-	prog := createSocketFilter(t)
+	prog := mustSocketFilter(t)
 	c := qt.New(t)
-	defer prog.Close()
 
 	tmp := testutils.TempBPFFS(t)
 
@@ -194,7 +246,7 @@ func TestProgramPin(t *testing.T) {
 	}
 
 	pinned := prog.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	prog.Close()
 
@@ -215,9 +267,8 @@ func TestProgramPin(t *testing.T) {
 }
 
 func TestProgramUnpin(t *testing.T) {
-	prog := createSocketFilter(t)
+	prog := mustSocketFilter(t)
 	c := qt.New(t)
-	defer prog.Close()
 
 	tmp := testutils.TempBPFFS(t)
 
@@ -227,7 +278,7 @@ func TestProgramUnpin(t *testing.T) {
 	}
 
 	pinned := prog.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	if err := prog.Unpin(); err != nil {
 		t.Fatal("Failed to unpin program:", err)
@@ -241,8 +292,7 @@ func TestProgramLoadPinnedWithFlags(t *testing.T) {
 	// Introduced in commit 6e71b04a8224.
 	testutils.SkipOnOldKernel(t, "4.14", "file_flags in BPF_OBJ_GET")
 
-	prog := createSocketFilter(t)
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
 	tmp := testutils.TempBPFFS(t)
 
@@ -330,7 +380,7 @@ func TestProgramVerifierOutput(t *testing.T) {
 	}
 }
 
-func TestProgramWithUnsatisfiedReference(t *testing.T) {
+func TestProgramWithUnsatisfiedMap(t *testing.T) {
 	coll, err := LoadCollectionSpec("testdata/loader-el.elf")
 	if err != nil {
 		t.Fatal(err)
@@ -341,8 +391,9 @@ func TestProgramWithUnsatisfiedReference(t *testing.T) {
 	progSpec.ByteOrder = nil
 
 	_, err = NewProgram(progSpec)
-	if !errors.Is(err, errUnsatisfiedReference) {
-		t.Fatal("Expected an error wrapping errUnsatisfiedReference, got", err)
+	testutils.SkipIfNotSupported(t, err)
+	if !errors.Is(err, asm.ErrUnsatisfiedMapReference) {
+		t.Fatal("Expected an error wrapping asm.ErrUnsatisfiedMapReference, got", err)
 	}
 	t.Log(err)
 }
@@ -352,15 +403,14 @@ func TestProgramName(t *testing.T) {
 		t.Skip(err)
 	}
 
-	prog := createSocketFilter(t)
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
-	info, err := bpfGetProgInfoByFD(prog.fd, nil)
-	if err != nil {
+	var info sys.ProgInfo
+	if err := sys.ObjInfo(prog.fd, &info); err != nil {
 		t.Fatal(err)
 	}
 
-	if name := internal.CString(info.name[:]); name != "test" {
+	if name := unix.ByteSliceToString(info.Name[:]); name != "test" {
 		t.Errorf("Name is not test, got '%s'", name)
 	}
 }
@@ -395,18 +445,7 @@ func TestProgramMarshaling(t *testing.T) {
 	arr := createProgramArray(t)
 	defer arr.Close()
 
-	prog, err := NewProgram(&ProgramSpec{
-		Type: SocketFilter,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 0, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
 	if err := arr.Put(idx, prog); err != nil {
 		t.Fatal("Can't put program:", err)
@@ -435,18 +474,7 @@ func TestProgramMarshaling(t *testing.T) {
 }
 
 func TestProgramFromFD(t *testing.T) {
-	prog, err := NewProgram(&ProgramSpec{
-		Type: SocketFilter,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 0, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
 	// If you're thinking about copying this, don't. Use
 	// Clone() instead.
@@ -470,73 +498,54 @@ func TestHaveProgTestRun(t *testing.T) {
 
 func TestProgramGetNextID(t *testing.T) {
 	testutils.SkipOnOldKernel(t, "4.13", "bpf_prog_get_next_id")
-	var next ProgramID
 
-	prog, err := NewProgram(&ProgramSpec{
-		Type: SkSKB,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 0, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
-
-	if next, err = ProgramGetNextID(ProgramID(0)); err != nil {
-		t.Fatal("Can't get next ID:", err)
-	}
-	if next == ProgramID(0) {
-		t.Fatal("Expected next ID other than 0")
-	}
+	// Ensure there is at least one program loaded
+	_ = mustSocketFilter(t)
 
 	// As there can be multiple eBPF programs, we loop over all of them and
 	// make sure, the IDs increase and the last call will return ErrNotExist
+	last := ProgramID(0)
 	for {
-		last := next
-		if next, err = ProgramGetNextID(last); err != nil {
-			if !errors.Is(err, ErrNotExist) {
-				t.Fatal("Expected ErrNotExist, got:", err)
+		next, err := ProgramGetNextID(last)
+		if errors.Is(err, os.ErrNotExist) {
+			if last == 0 {
+				t.Fatal("Got ErrNotExist on the first iteration")
 			}
 			break
+		}
+		if err != nil {
+			t.Fatal("Unexpected error:", err)
 		}
 		if next <= last {
 			t.Fatalf("Expected next ID (%d) to be higher than the last ID (%d)", next, last)
 		}
+		last = next
 	}
 }
 
 func TestNewProgramFromID(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "4.13", "bpf_prog_get_fd_by_id")
+	prog := mustSocketFilter(t)
 
-	prog, err := NewProgram(&ProgramSpec{
-		Type: SkSKB,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 0, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	})
+	info, err := prog.Info()
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("Could not get program info:", err)
 	}
-	defer prog.Close()
-	var next ProgramID
 
-	next, err = prog.ID()
+	id, ok := info.ID()
+	if !ok {
+		t.Skip("Program ID not supported")
+	}
+
+	prog2, err := NewProgramFromID(id)
 	if err != nil {
-		t.Fatal("Could not get ID of program:", err)
+		t.Fatalf("Can't get FD for program ID %d: %v", id, err)
 	}
-
-	if _, err = NewProgramFromID(next); err != nil {
-		t.Fatalf("Can't get FD for program ID %d: %v", uint32(next), err)
-	}
+	prog2.Close()
 
 	// As there can be multiple programs, we use max(uint32) as ProgramID to trigger an expected error.
 	_, err = NewProgramFromID(ProgramID(math.MaxUint32))
-	if !errors.Is(err, ErrNotExist) {
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("Expected ErrNotExist, got:", err)
 	}
 }
@@ -640,16 +649,15 @@ func TestProgramTypeLSM(t *testing.T) {
 	}
 }
 
-func TestProgramTargetBTF(t *testing.T) {
-	// Load a file that contains valid BTF, but doesn't contain the types
-	// we need for bpf_iter.
-	fh, err := os.Open("testdata/invalid_btf_map_init-el.elf")
+func TestProgramKernelTypes(t *testing.T) {
+	if _, err := os.Stat("/sys/kernel/btf/vmlinux"); os.IsNotExist(err) {
+		t.Skip("/sys/kernel/btf/vmlinux not present")
+	}
+
+	btfSpec, err := btf.LoadSpec("/sys/kernel/btf/vmlinux")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fh.Close()
-
-	reader := &testReaderAt{file: fh}
 
 	prog, err := NewProgramWithOptions(&ProgramSpec{
 		Type:       Tracing,
@@ -661,27 +669,81 @@ func TestProgramTargetBTF(t *testing.T) {
 		},
 		License: "MIT",
 	}, ProgramOptions{
-		TargetBTF: reader,
+		KernelTypes: btfSpec,
 	})
-	if err == nil {
-		prog.Close()
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal("NewProgram with Target:", err)
 	}
-	if !errors.Is(err, ErrNotSupported) {
-		t.Error("Expected ErrNotSupported, got", err)
+	prog.Close()
+}
+
+func TestProgramBindMap(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.10", "BPF_PROG_BIND_MAP")
+
+	arr, err := NewMap(&MapSpec{
+		Type:       Array,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 1,
+	})
+	if err != nil {
+		t.Errorf("Failed to load map: %v", err)
 	}
-	if !reader.read {
-		t.Error("TargetBTF is not read")
+	defer arr.Close()
+
+	prog := mustSocketFilter(t)
+
+	// The attached map does not contain BTF information. So
+	// the metadata part of the program will be empty. This
+	// test just makes sure that we can bind a map to a program.
+	if err := prog.BindMap(arr); err != nil {
+		t.Errorf("Failed to bind map to program: %v", err)
 	}
 }
 
-type testReaderAt struct {
-	file *os.File
-	read bool
-}
+func TestProgramInstructions(t *testing.T) {
+	name := "test_prog"
+	spec := &ProgramSpec{
+		Type: SocketFilter,
+		Name: name,
+		Instructions: asm.Instructions{
+			asm.LoadImm(asm.R0, -1, asm.DWord).WithSymbol(name),
+			asm.Return(),
+		},
+		License: "MIT",
+	}
 
-func (ra *testReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	ra.read = true
-	return ra.file.ReadAt(p, off)
+	prog, err := NewProgram(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+
+	pi, err := prog.Info()
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	insns, err := pi.Instructions()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tag, err := spec.Tag()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tagXlated, err := insns.Tag(internal.NativeEndian)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tag != tagXlated {
+		t.Fatalf("tag %s differs from xlated instructions tag %s", tag, tagXlated)
+	}
 }
 
 func createProgramArray(t *testing.T) *Map {
@@ -709,13 +771,14 @@ var socketFilterSpec = &ProgramSpec{
 	License: "MIT",
 }
 
-func createSocketFilter(t *testing.T) *Program {
-	t.Helper()
+func mustSocketFilter(tb testing.TB) *Program {
+	tb.Helper()
 
 	prog, err := NewProgram(socketFilterSpec)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
+	tb.Cleanup(func() { prog.Close() })
 
 	return prog
 }

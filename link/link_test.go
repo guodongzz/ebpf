@@ -2,7 +2,6 @@ package link
 
 import (
 	"errors"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 )
@@ -47,12 +47,7 @@ func TestRawLink(t *testing.T) {
 		t.Error("Link program ID doesn't match program ID")
 	}
 
-	testLink(t, link, testLinkOptions{
-		prog: prog,
-		loadPinned: func(f string, opts *ebpf.LoadPinOptions) (Link, error) {
-			return LoadPinnedRawLink(f, UnspecifiedType, opts)
-		},
-	})
+	testLink(t, &linkCgroup{*link}, prog)
 }
 
 func TestRawLinkLoadPinnedWithOptions(t *testing.T) {
@@ -77,7 +72,7 @@ func TestRawLinkLoadPinnedWithOptions(t *testing.T) {
 
 	// It seems like the kernel ignores BPF_F_RDONLY when updating a link,
 	// so we can't test this.
-	_, err = LoadPinnedRawLink(path, UnspecifiedType, &ebpf.LoadPinOptions{
+	_, err = loadPinnedRawLink(path, &ebpf.LoadPinOptions{
 		Flags: math.MaxUint32,
 	})
 	if !errors.Is(err, unix.EINVAL) {
@@ -90,62 +85,27 @@ func mustCgroupFixtures(t *testing.T) (*os.File, *ebpf.Program) {
 
 	testutils.SkipIfNotSupported(t, haveProgAttach())
 
-	return testutils.CreateCgroup(t), mustCgroupEgressProgram(t)
+	return testutils.CreateCgroup(t), mustLoadProgram(t, ebpf.CGroupSKB, 0, "")
 }
 
-func mustCgroupEgressProgram(t *testing.T) *ebpf.Program {
+func testLink(t *testing.T, link Link, prog *ebpf.Program) {
 	t.Helper()
 
-	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
-		Type:       ebpf.CGroupSKB,
-		AttachType: ebpf.AttachCGroupInetEgress,
-		License:    "MIT",
-		Instructions: asm.Instructions{
-			asm.Mov.Imm(asm.R0, 0),
-			asm.Return(),
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() {
-		prog.Close()
-	})
-
-	return prog
-}
-
-type testLinkOptions struct {
-	prog       *ebpf.Program
-	loadPinned func(string, *ebpf.LoadPinOptions) (Link, error)
-}
-
-func testLink(t *testing.T, link Link, opts testLinkOptions) {
-	t.Helper()
-
-	tmp, err := ioutil.TempDir("/sys/fs/bpf", "ebpf-test")
+	tmp, err := os.MkdirTemp("/sys/fs/bpf", "ebpf-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
 
-	path := filepath.Join(tmp, "link")
-	err = link.Pin(path)
-	if err == ErrNotSupported {
-		t.Errorf("%T.Pin returns unwrapped ErrNotSupported", link)
-	}
-
-	if opts.loadPinned == nil {
-		if !errors.Is(err, ErrNotSupported) {
-			t.Errorf("%T.Pin doesn't return ErrNotSupported: %s", link, err)
-		}
-	} else {
+	t.Run("link/pinning", func(t *testing.T) {
+		path := filepath.Join(tmp, "link")
+		err = link.Pin(path)
+		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatalf("Can't pin %T: %s", link, err)
 		}
 
-		link2, err := opts.loadPinned(path, nil)
+		link2, err := LoadPinnedLink(path, nil)
 		if err != nil {
 			t.Fatalf("Can't load pinned %T: %s", link, err)
 		}
@@ -155,22 +115,17 @@ func testLink(t *testing.T, link Link, opts testLinkOptions) {
 			t.Errorf("Loading a pinned %T returns a %T", link, link2)
 		}
 
-		_, err = opts.loadPinned(path, &ebpf.LoadPinOptions{
+		_, err = LoadPinnedLink(path, &ebpf.LoadPinOptions{
 			Flags: math.MaxUint32,
 		})
 		if !errors.Is(err, unix.EINVAL) {
 			t.Errorf("Loading a pinned %T doesn't respect flags", link)
 		}
-	}
+	})
 
-	t.Run("update", func(t *testing.T) {
-		err := link.Update(opts.prog)
-		if err == ErrNotSupported {
-			t.Fatal("Update returns unwrapped ErrNotSupported", link)
-		}
-		if errors.Is(err, ErrNotSupported) {
-			return
-		}
+	t.Run("link/update", func(t *testing.T) {
+		err := link.Update(prog)
+		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatal("Update returns an error:", err)
 		}
@@ -187,7 +142,71 @@ func testLink(t *testing.T, link Link, opts testLinkOptions) {
 		}()
 	})
 
+	t.Run("link/info", func(t *testing.T) {
+		info, err := link.Info()
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal("Link info returns an error:", err)
+		}
+
+		if info.Type == 0 {
+			t.Fatal("Failed to get link info type")
+		}
+
+		switch info.Type {
+		case sys.BPF_LINK_TYPE_TRACING:
+			if info.Tracing() == nil {
+				t.Fatalf("Failed to get link tracing extra info")
+			}
+		case sys.BPF_LINK_TYPE_CGROUP:
+			cg := info.Cgroup()
+			if cg.CgroupId == 0 {
+				t.Fatalf("Failed to get link Cgroup extra info")
+			}
+		case sys.BPF_LINK_TYPE_NETNS:
+			netns := info.NetNs()
+			if netns.AttachType == 0 {
+				t.Fatalf("Failed to get link NetNs extra info")
+			}
+		case sys.BPF_LINK_TYPE_XDP:
+			xdp := info.XDP()
+			if xdp.Ifindex == 0 {
+				t.Fatalf("Failed to get link XDP extra info")
+			}
+		}
+	})
+
 	if err := link.Close(); err != nil {
 		t.Fatalf("%T.Close returns an error: %s", link, err)
 	}
+}
+
+func mustLoadProgram(tb testing.TB, typ ebpf.ProgramType, attachType ebpf.AttachType, attachTo string) *ebpf.Program {
+	tb.Helper()
+
+	license := "MIT"
+	switch typ {
+	case ebpf.RawTracepoint, ebpf.LSM:
+		license = "GPL"
+	}
+
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type:       typ,
+		AttachType: attachType,
+		AttachTo:   attachTo,
+		License:    license,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	tb.Cleanup(func() {
+		prog.Close()
+	})
+
+	return prog
 }
